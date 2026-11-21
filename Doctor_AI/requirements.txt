@@ -1,2 +1,6 @@
-streamlit
+streamlit>=1.50
+python-dotenv
+groq
 google-genai
+openai
+pypdf

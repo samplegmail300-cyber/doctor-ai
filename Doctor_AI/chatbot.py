@@ -13,8 +13,19 @@ Features:
 """
 
 import os
-from dotenv import load_dotenv
-from groq import Groq
+
+# These two libraries are optional: if they are missing, the app still starts
+# and uses the keyword fallback instead of crashing.
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 # ----------------------------------------------------------
 # PART 1: CONFIGURATION
@@ -266,7 +277,7 @@ def _get_ai_response(user_message):
 
     api_key = os.getenv("GROQ_API_KEY")
 
-    if not api_key:
+    if not api_key or Groq is None:
         return None
 
     client = Groq(api_key=api_key)

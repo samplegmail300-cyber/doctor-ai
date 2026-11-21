@@ -6,7 +6,11 @@ Homepage, navigation and integrated chatbot.
 import html
 
 import streamlit as st
-from chatbot import get_bot_response
+import db
+from ai_engine import ask_ai, get_last_errors, providers_status
+from file_utils import (
+    ALL_TYPES, IMAGE_TYPES, MAX_FILE_MB, files_label, files_text, read_many,
+)
 from symptoms import check_symptoms, SUPPORTED_SYMPTOMS
 from diseases import get_disease_names, get_disease_info
 
@@ -32,8 +36,11 @@ APP_SUBTITLE = "Your Intelligent Healthcare Assistant"
 NAV_OPTIONS = [
     "🏠 Home",
     "🤖 AI Chatbot",
+    "📷 Image Diagnosis",
+    "🧪 Report Analysis",
     "🩺 Symptom Checker",
     "📚 Disease Information",
+    "🗂️ History & Profile",
     "ℹ️ About",
 ]
 
@@ -42,10 +49,26 @@ FEATURES = [
     (
         "🤖",
         "AI Chatbot",
-        "Chat with a friendly assistant and ask general health questions "
-        "in plain language.",
+        "Chat with an assistant that remembers your conversation and "
+        "can read the files you attach.",
         "🤖 AI Chatbot",
         "Open Chatbot →",
+    ),
+    (
+        "📷",
+        "Image Diagnosis",
+        "Take a photo with your camera or upload one and get possible "
+        "explanations and how urgent it looks.",
+        "📷 Image Diagnosis",
+        "Analyse Photo →",
+    ),
+    (
+        "🧪",
+        "Report Analysis",
+        "Upload a lab report or prescription and get a simple explanation "
+        "plus questions for your doctor.",
+        "🧪 Report Analysis",
+        "Analyse Report →",
     ),
     (
         "🩺",
@@ -54,22 +77,6 @@ FEATURES = [
         "may be related to.",
         "🩺 Symptom Checker",
         "Check Symptoms →",
-    ),
-    (
-        "📚",
-        "Disease Information",
-        "Read simple explanations about common diseases, their causes "
-        "and prevention.",
-        "📚 Disease Information",
-        "Explore Diseases →",
-    ),
-    (
-        "💡",
-        "Health Guidance",
-        "Get general wellness tips and advice on when to see a "
-        "healthcare professional.",
-        "ℹ️ About",
-        "Learn More →",
     ),
 ]
 
@@ -888,45 +895,116 @@ def home_page():
 
 
 # --------------------------------------------------
-# 6. AI CHATBOT PAGE
+# 6. AI CHATBOT PAGE (memory, history and file attachments)
 # --------------------------------------------------
 
-def add_exchange(user_text):
-    """Save the user's message and the chatbot's reply in the history."""
-    st.session_state.messages.append({"role": "user", "content": user_text})
-    reply = get_bot_response(user_text)
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+def start_new_chat():
+    st.session_state.conv_id = None
+    st.session_state.case_result = None
 
 
-def clear_chat():
-    st.session_state.messages = []
+def open_conversation(conv_id, page="🤖 AI Chatbot"):
+    """Open a saved conversation and jump to a page (used by buttons)."""
+    st.session_state.conv_id = conv_id
+    st.session_state.nav_page = page
+
+
+def delete_saved_chat(conv_id):
+    db.delete_conversation(conv_id)
+    if st.session_state.get("conv_id") == conv_id:
+        st.session_state.conv_id = None
+
+
+def send_message(text, uploaded_files=None, mode="chat", title=None):
+    """
+    Save the user's message, ask the AI (it receives the whole conversation,
+    the patient profile and any attached files), then save the answer.
+    """
+    text = (text or "").strip()
+    files, skipped = read_many(uploaded_files)
+    if skipped:
+        st.session_state.upload_warning = (
+            "These files were skipped (unsupported type or larger than "
+            f"{MAX_FILE_MB} MB): " + ", ".join(skipped)
+        )
+
+    conv_id = st.session_state.get("conv_id")
+    if not conv_id:
+        conv_title = title or text[:50] or files_label(files) or "New chat"
+        conv_id = db.create_conversation(conv_title, kind=mode)
+        st.session_state.conv_id = conv_id
+
+    history = db.get_messages(conv_id)   # earlier messages only
+    profile = db.get_profile()
+
+    with st.spinner("Doctor AI is analysing..."):
+        result = ask_ai(text, history, profile, files, mode)
+
+    db.add_message(
+        conv_id,
+        "user",
+        text or "(file uploaded)",
+        attachment_name=files_label(files),
+        attachment_text=files_text(files),
+    )
+    db.add_message(conv_id, "assistant", result["text"])
+
+    st.session_state.last_provider = result["provider"]
+    st.session_state.last_errors = get_last_errors()
+    return result
+
+
+def show_upload_warning():
+    warning = st.session_state.pop("upload_warning", None)
+    if warning:
+        st.warning(warning)
+
+
+def show_ai_problems():
+    """Small expander that shows why the AI failed (keys are hidden)."""
+    errors = st.session_state.get("last_errors")
+    if errors:
+        with st.expander("⚙️ AI connection problems (for debugging)"):
+            for line in errors:
+                st.code(line)
+            st.caption("Check your .env file and that the packages are installed.")
 
 
 def chatbot_page():
     show_page_banner(
         "🤖",
         "Doctor AI Chatbot",
-        "Ask general health questions and get simple, friendly answers.",
+        "Ask health questions, attach reports or photos, and continue "
+        "the conversation any time.",
     )
 
     st.warning(
-        "Medical disclaimer: This chatbot is a student project and "
-        "provides general health information only. It cannot diagnose "
-        "diseases or recommend medicines. In an emergency, contact "
-        "local emergency services immediately."
+        "Medical disclaimer: Doctor AI provides general health information "
+        "only. It cannot give a final diagnosis or recommend medicines. "
+        "In an emergency, contact local emergency services immediately."
     )
 
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    conv_id = st.session_state.get("conv_id")
+    messages = db.get_messages(conv_id) if conv_id else []
+
+    top_left, top_right = st.columns([1, 3])
+    with top_left:
+        st.button("➕ New chat", key="new_chat", on_click=start_new_chat, width="stretch")
+    with top_right:
+        if conv_id:
+            conversation = db.get_conversation(conv_id)
+            if conversation:
+                st.caption(f"💬 {conversation['title']}  ·  saved automatically")
+
+    show_upload_warning()
 
     # Welcome message and quick questions when the chat is empty
-    if not st.session_state.messages:
+    if not messages:
         with st.chat_message("assistant", avatar=AVATARS["assistant"]):
             st.write(
-                "Hello! 👋 I am Doctor AI. You can ask me about "
-                "fever, headache, cough, cold, sore throat, "
-                "stomach pain, or healthy lifestyle tips."
+                "Hello! 👋 I am Doctor AI. Tell me your symptoms, or use the "
+                "📎 button to attach a lab report, prescription or photo. "
+                "I remember everything we discuss in this chat."
             )
 
         st.caption("💬 Try one of these questions:")
@@ -938,30 +1016,264 @@ def chatbot_page():
                 st.button(
                     question,
                     key=f"suggestion_{index}",
-                    on_click=add_exchange,
+                    on_click=send_message,
                     args=(question,),
                     width="stretch",
                 )
 
     # Display previous messages
-    for message in st.session_state.messages:
+    for message in messages:
         with st.chat_message(message["role"], avatar=AVATARS[message["role"]]):
-            st.write(message["content"])
+            st.markdown(message["content"])
+            if message.get("attachment_name"):
+                st.caption(f"📎 {message['attachment_name']}")
 
-    # Button to clear the conversation
-    if st.session_state.messages:
-        st.button("🗑️ Clear chat", key="clear_chat", on_click=clear_chat)
+    if st.session_state.get("last_provider") in ("keyword-fallback", "none"):
+        show_ai_problems()
 
-    # Chat input
-    user_text = st.chat_input(
-        "Type your health question here..."
+    # Chat input (text + optional files)
+    prompt = st.chat_input(
+        "Type your health question here... (use 📎 to attach files)",
+        accept_file="multiple",
+        file_type=ALL_TYPES,
     )
 
-    if user_text:
-        add_exchange(user_text)
-
-        # Refresh page to display both messages
+    if prompt:
+        send_message(
+            getattr(prompt, "text", "") or "",
+            list(getattr(prompt, "files", []) or []),
+        )
         st.rerun()
+
+
+# --------------------------------------------------
+# 6b. IMAGE DIAGNOSIS PAGE
+# --------------------------------------------------
+
+def show_case_result(kind):
+    """Show the newest result of this page and a button to ask follow-ups."""
+    case = st.session_state.get("case_result")
+    if not case or case.get("kind") != kind:
+        return
+
+    st.divider()
+    st.subheader("📋 Result")
+    if case["provider"] not in ("keyword-fallback", "none"):
+        st.caption(f"Analysed by {case['provider']}")
+    with st.container(border=True):
+        st.markdown(case["text"])
+    if not case["ok"]:
+        show_ai_problems()
+    else:
+        st.button(
+            "💬 Ask follow-up questions about this",
+            key=f"followup_{kind}",
+            on_click=open_conversation,
+            args=(case["conv_id"],),
+        )
+
+
+def run_case(kind, text, files, title):
+    """Start a NEW conversation for a photo / report and keep the result."""
+    st.session_state.conv_id = None
+    result = send_message(text, files, mode=kind, title=title)
+    st.session_state.case_result = {
+        "kind": kind,
+        "text": result["text"],
+        "provider": result["provider"],
+        "ok": result["ok"],
+        "conv_id": st.session_state.conv_id,
+    }
+
+
+def image_diagnosis_page():
+    show_page_banner(
+        "📷",
+        "Image Diagnosis",
+        "Take a photo or upload an image (skin, eye, wound, throat, scan) "
+        "and get a careful AI explanation.",
+    )
+
+    st.warning(
+        "A photo can never confirm a diagnosis. This tool gives possible "
+        "explanations and tells you how urgent it looks. Please see a doctor."
+    )
+
+    source = st.radio(
+        "Photo source",
+        ["📷 Use camera", "🖼️ Upload image"],
+        horizontal=True,
+        key="image_source",
+    )
+
+    if source.startswith("📷"):
+        photo = st.camera_input("Take a clear, well-lit, close-up photo")
+    else:
+        photo = st.file_uploader(
+            "Upload a photo, X-ray or scan", type=IMAGE_TYPES, key="image_upload"
+        )
+
+    description = st.text_area(
+        "Describe the problem (the more detail, the better)",
+        placeholder="Where is it? Since when? Pain, itching, fever, spreading, "
+        "any medicine or cream used...",
+        key="image_description",
+    )
+
+    if st.button(
+        "🔍 Analyse image", type="primary", width="stretch", disabled=photo is None
+    ):
+        run_case("image", description, [photo], "📷 Image: " + (description[:40] or "photo"))
+
+    show_upload_warning()
+    show_case_result("image")
+
+
+# --------------------------------------------------
+# 6c. REPORT ANALYSIS PAGE
+# --------------------------------------------------
+
+def report_analysis_page():
+    show_page_banner(
+        "🧪",
+        "Report Analysis",
+        "Upload a lab test, X-ray report or prescription (PDF, photo or text) "
+        "and get a clear explanation.",
+    )
+
+    st.warning(
+        "Doctor AI explains reports in simple words and prepares questions "
+        "for your doctor. It does not replace the doctor who ordered the test."
+    )
+
+    report_files = st.file_uploader(
+        "Upload your report(s)",
+        type=ALL_TYPES,
+        accept_multiple_files=True,
+        key="report_upload",
+    )
+
+    note = st.text_area(
+        "Anything the AI should know? (optional)",
+        placeholder="Example: I am diabetic. Doctor asked for this test because of tiredness.",
+        key="report_note",
+    )
+
+    if st.button(
+        "🧪 Analyse report", type="primary", width="stretch", disabled=not report_files
+    ):
+        names = ", ".join(f.name for f in report_files)
+        run_case("report", note, list(report_files), "🧪 Report: " + names[:50])
+
+    show_upload_warning()
+    show_case_result("report")
+
+
+# --------------------------------------------------
+# 6d. HISTORY AND PROFILE PAGE
+# --------------------------------------------------
+
+KIND_ICONS = {"chat": "💬", "image": "📷", "report": "🧪"}
+
+
+def history_page():
+    show_page_banner(
+        "🗂️",
+        "History & Profile",
+        "Open old conversations and tell Doctor AI about yourself so answers fit you.",
+    )
+
+    st.info(
+        "Everything is saved only on this computer (data/doctor_ai.db). "
+        "It is not uploaded to GitHub."
+    )
+
+    chats_tab, profile_tab = st.tabs(["🗂️ Saved chats", "👤 Patient profile"])
+
+    with chats_tab:
+        query = st.text_input("🔎 Search all messages", key="history_search")
+
+        if query.strip():
+            hits = db.search_messages(query)
+            if not hits:
+                st.caption("No messages found.")
+            for hit in hits:
+                with st.container(border=True):
+                    st.caption(f"{hit['title']} · {hit['created_at']} · {hit['role']}")
+                    st.write(hit["content"][:300])
+                    st.button(
+                        "Open chat",
+                        key=f"hit_{hit['conversation_id']}_{hit['created_at']}_{hit['role']}",
+                        on_click=open_conversation,
+                        args=(hit["conversation_id"],),
+                    )
+        else:
+            conversations = db.list_conversations()
+            if not conversations:
+                show_placeholder(
+                    "🗂️", "No saved chats yet", "Start a chat and it will appear here."
+                )
+            for conv in conversations:
+                icon = KIND_ICONS.get(conv["kind"], "💬")
+                info_col, open_col, delete_col = st.columns([6, 1.2, 1.2])
+                with info_col:
+                    st.markdown(f"**{icon} {conv['title']}**")
+                    st.caption(f"Last activity: {conv['updated_at']}")
+                with open_col:
+                    st.button(
+                        "Open",
+                        key=f"open_{conv['id']}",
+                        on_click=open_conversation,
+                        args=(conv["id"],),
+                        width="stretch",
+                    )
+                with delete_col:
+                    st.button(
+                        "Delete",
+                        key=f"delete_{conv['id']}",
+                        on_click=delete_saved_chat,
+                        args=(conv["id"],),
+                        width="stretch",
+                    )
+
+            if conversations:
+                st.divider()
+                confirm = st.checkbox("I want to delete ALL saved chats", key="confirm_delete_all")
+                if st.button("🗑️ Delete everything", disabled=not confirm):
+                    db.delete_all()
+                    st.session_state.conv_id = None
+                    st.rerun()
+
+    with profile_tab:
+        st.write(
+            "This information is added to every question so answers consider "
+            "your age, allergies and known conditions. It stays on this computer."
+        )
+        profile = db.get_profile()
+        with st.form("profile_form"):
+            name = st.text_input("Name (optional)", value=profile["name"])
+            age_col, sex_col = st.columns(2)
+            with age_col:
+                age = st.text_input("Age", value=profile["age"])
+            with sex_col:
+                sex_options = ["", "Female", "Male", "Other"]
+                sex = st.selectbox(
+                    "Sex",
+                    sex_options,
+                    index=sex_options.index(profile["sex"]) if profile["sex"] in sex_options else 0,
+                )
+            conditions = st.text_area("Known conditions", value=profile["conditions"],
+                                      placeholder="Diabetes, asthma, high blood pressure...")
+            allergies = st.text_area("Allergies", value=profile["allergies"])
+            medications = st.text_area("Medicines you currently take (as told by your doctor)",
+                                       value=profile["medications"])
+            notes = st.text_area("Other notes", value=profile["notes"])
+            if st.form_submit_button("💾 Save profile", type="primary"):
+                db.save_profile({
+                    "name": name, "age": age, "sex": sex, "conditions": conditions,
+                    "allergies": allergies, "medications": medications, "notes": notes,
+                })
+                st.success("Profile saved.")
 
 
 # --------------------------------------------------
@@ -1121,8 +1433,11 @@ def about_page():
 PAGES = {
     "🏠 Home": home_page,
     "🤖 AI Chatbot": chatbot_page,
+    "📷 Image Diagnosis": image_diagnosis_page,
+    "🧪 Report Analysis": report_analysis_page,
     "🩺 Symptom Checker": symptom_checker_page,
     "📚 Disease Information": disease_information_page,
+    "🗂️ History & Profile": history_page,
     "ℹ️ About": about_page,
 }
 
@@ -1133,6 +1448,7 @@ PAGES = {
 
 def main():
 
+    db.init_db()
     load_css()
 
     # Remember which page is open (buttons on the home page can change it)
@@ -1163,6 +1479,11 @@ def main():
 
         st.divider()
 
+        status = providers_status()
+        st.caption(
+            "AI keys: "
+            + " · ".join(f"{'✅' if ok else '❌'} {name}" for name, ok in status.items())
+        )
         st.caption(
             "⚠️ For educational use only. Not medical advice."
         )
